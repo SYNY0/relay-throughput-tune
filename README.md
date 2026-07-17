@@ -7,7 +7,7 @@
 ## 一键使用
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SYNY0/relay-throughput-tune/main/relay-throughput-tune.sh -o /tmp/relay-throughput-tune.sh && sudo bash /tmp/relay-throughput-tune.sh
+curl -fsSL https://raw.githubusercontent.com/SYNY0/relay-throughput-tune/main/relay-throughput-tune.sh -o /tmp/relay-throughput-tune.sh && bash /tmp/relay-throughput-tune.sh
 ```
 
 脚本会交互询问服务器带宽与典型 RTT，写入 `/etc/sysctl.d/zz-relay-throughput.conf`，并在 `/root/relay-tune-backup-时间戳/` 保存备份和 `rollback.sh`。
@@ -18,16 +18,16 @@ curl -fsSL https://raw.githubusercontent.com/SYNY0/relay-throughput-tune/main/re
 
 ```bash
 # 更保守的内存上限
-PROFILE=balanced sudo bash relay-throughput-tune.sh
+PROFILE=balanced bash relay-throughput-tune.sh
 
 # 更适合大量并发连接的内存上限
-PROFILE=concurrency sudo bash relay-throughput-tune.sh
+PROFILE=concurrency bash relay-throughput-tune.sh
 ```
 
 只有在 `/proc/net/softnet_stat` 的 `time_squeeze` 或丢包计数持续增长、且确认软中断是瓶颈时，才建议使用激进软中断参数：
 
 ```bash
-AGGRESSIVE_SOFTIRQ=1 sudo bash relay-throughput-tune.sh
+AGGRESSIVE_SOFTIRQ=1 bash relay-throughput-tune.sh
 ```
 
 ## 部署后检查
@@ -54,3 +54,17 @@ tc qdisc show dev "$(ip route show default | awk '/default/ {print $5; exit}')"
 ## 许可证
 
 MIT
+
+## Automatic detection
+
+The default command identifies the public server location and tests usable download bandwidth twice against Cloudflare. If an installed `speedtest` (Ookla CLI) or `speedtest-cli` command is available, it is tested as a second source; the default `BANDWIDTH_POLICY=peak` selects the highest successful result.
+
+The result is an Internet-egress estimate, not a guarantee for every relay path. For target-specific tuning, use a real destination as the RTT probe or override the value:
+
+```bash
+RELAY_HOST=your-relay-destination.example bash /tmp/relay-throughput-tune.sh
+# or
+BW_MBPS=1000 RTT_MS=150 bash /tmp/relay-throughput-tune.sh
+```
+
+Use `BANDWIDTH_POLICY=average` or `BANDWIDTH_POLICY=conservative` when a less optimistic bandwidth estimate is preferred. Set `AUTO_DETECT=0` to disable automatic public-IP/location and bandwidth detection.
