@@ -7,6 +7,10 @@
 #   PROFILE=throughput|balanced|concurrency   (default: throughput)
 #   AGGRESSIVE_SOFTIRQ=1                      (only after measured softnet pressure)
 #   ALLOW_LATE_CONFLICTS=1                    (override a fatal later config conflict)
+#   AUTO_DETECT=0                             (disable public-IP/location and bandwidth detection)
+#   BW_MBPS=1000 RTT_MS=150                   (explicitly override detected values)
+#   RELAY_HOST=example.com                    (optional ICMP RTT probe to the relay destination)
+#   BANDWIDTH_POLICY=peak|average|conservative (default: peak across test sources)
 set -Eeuo pipefail
 umask 022
 
@@ -18,6 +22,11 @@ MIB=1048576
 PROFILE=${PROFILE:-throughput}
 AGGRESSIVE_SOFTIRQ=${AGGRESSIVE_SOFTIRQ:-0}
 ALLOW_LATE_CONFLICTS=${ALLOW_LATE_CONFLICTS:-0}
+AUTO_DETECT=${AUTO_DETECT:-1}
+RELAY_HOST=${RELAY_HOST:-}
+SPEEDTEST_BYTES=${SPEEDTEST_BYTES:-33554432}
+SPEEDTEST_ATTEMPTS=${SPEEDTEST_ATTEMPTS:-2}
+BANDWIDTH_POLICY=${BANDWIDTH_POLICY:-peak}
 CHANGES_STARTED=0
 COMMITTED=0
 RESTORED=0
@@ -77,6 +86,8 @@ for cmd in awk grep sysctl install nproc ip; do
 done
 [[ $AGGRESSIVE_SOFTIRQ == 0 || $AGGRESSIVE_SOFTIRQ == 1 ]] || die 'AGGRESSIVE_SOFTIRQ must be 0 or 1.'
 [[ $ALLOW_LATE_CONFLICTS == 0 || $ALLOW_LATE_CONFLICTS == 1 ]] || die 'ALLOW_LATE_CONFLICTS must be 0 or 1.'
+[[ $AUTO_DETECT == 0 || $AUTO_DETECT == 1 ]] || die 'AUTO_DETECT must be 0 or 1.'
+case "$BANDWIDTH_POLICY" in peak|average|conservative) ;; *) die 'BANDWIDTH_POLICY must be peak, average, or conservative.' ;; esac
 case "$PROFILE" in
   throughput)  RAM_FRACTION=0.08; ABS_CAP_BYTES=$((512 * MIB)) ;;
   balanced)    RAM_FRACTION=0.04; ABS_CAP_BYTES=$((256 * MIB)) ;;
@@ -85,10 +96,148 @@ case "$PROFILE" in
 esac
 
 is_uint() { [[ ${1:-} =~ ^[0-9]+$ ]] && (( 10#${1} > 0 )); }
-read -r -p 'Peak usable bandwidth in Mbps [1000]: ' BW_INPUT
-read -r -p 'High but common relay-path RTT in ms [150]: ' RTT_INPUT
-BW_MBPS=${BW_INPUT:-1000}
-RTT_MS=${RTT_INPUT:-150}
+is_uint "$SPEEDTEST_BYTES" || die 'SPEEDTEST_BYTES must be a positive integer.'
+is_uint "$SPEEDTEST_ATTEMPTS" || die 'SPEEDTEST_ATTEMPTS must be a positive integer.'
+
+json_value() {
+  # Works with both compact and pretty-printed simple JSON string fields.
+  awk -F'"' -v wanted="$1" '{for (i = 2; i <= NF; i += 4) if ($i == wanted) {print $(i + 2); exit}}'
+}
+
+detect_location() {
+  command -v curl >/dev/null 2>&1 || return 1
+  local json ip city region country org place
+  json=$(curl -fsSL --connect-timeout 4 --max-time 8 https://ipapi.co/json/ 2>/dev/null) || return 1
+  ip=$(json_value ip <<<"$json")
+  city=$(json_value city <<<"$json")
+  region=$(json_value region <<<"$json")
+  country=$(json_value country_name <<<"$json")
+  org=$(json_value org <<<"$json")
+  place=$(printf '%s, %s, %s' "${city:-unknown city}" "${region:-unknown region}" "${country:-unknown country}")
+  ok "Detected server location: $place${ip:+ | public IP: $ip}${org:+ | $org}"
+}
+
+detect_cloudflare_bandwidth_mbps() {
+  command -v curl >/dev/null 2>&1 || return 1
+  local attempt raw mbps fastest=0
+  info "Testing usable Internet download bandwidth (${SPEEDTEST_ATTEMPTS} x $((SPEEDTEST_BYTES / MIB)) MiB via Cloudflare)..." >&2
+  for ((attempt = 1; attempt <= SPEEDTEST_ATTEMPTS; attempt++)); do
+    raw=$(curl -fsSL --connect-timeout 5 --max-time 20 -o /dev/null \
+      -w '%{speed_download}' "https://speed.cloudflare.com/__down?bytes=${SPEEDTEST_BYTES}" 2>/dev/null) || continue
+    [[ $raw =~ ^[0-9]+([.][0-9]+)?$ ]] || continue
+    mbps=$(awk -v bytes="$raw" 'BEGIN { value = int((bytes * 8 / 1000000) + 0.5); if (value < 1) value = 1; print value }')
+    (( mbps > fastest )) && fastest=$mbps
+  done
+  (( fastest > 0 )) || return 1
+  printf '%s' "$fastest"
+}
+
+detect_speedtest_bandwidth_mbps() {
+  local output bytes mbps
+  if command -v speedtest >/dev/null 2>&1; then
+    info 'Testing usable Internet download bandwidth with installed Speedtest CLI...' >&2
+    output=$(speedtest --accept-license --accept-gdpr --format=json 2>/dev/null || speedtest -f json 2>/dev/null) || return 1
+    bytes=$(awk '
+      match($0, /"download"[[:space:]]*:[[:space:]]*\{[^}]*"bandwidth"[[:space:]]*:[[:space:]]*[0-9]+/) {
+        value = substr($0, RSTART, RLENGTH)
+        sub(/.*"bandwidth"[[:space:]]*:[[:space:]]*/, "", value)
+        print value
+        exit
+      }' <<<"$output")
+    [[ $bytes =~ ^[0-9]+$ ]] || return 1
+    mbps=$(awk -v value="$bytes" 'BEGIN { result = int((value * 8 / 1000000) + 0.5); if (result < 1) result = 1; print result }')
+    printf '%s' "$mbps"
+    return 0
+  fi
+  if command -v speedtest-cli >/dev/null 2>&1; then
+    info 'Testing usable Internet download bandwidth with installed speedtest-cli...' >&2
+    output=$(speedtest-cli --simple 2>/dev/null) || return 1
+    mbps=$(awk '/^Download:/ {value = $2; unit = $3; if (unit ~ /^Gbit/) value *= 1000; else if (unit ~ /^Kbit/) value /= 1000; printf "%.0f", value; exit}' <<<"$output")
+    is_uint "$mbps" || return 1
+    printf '%s' "$mbps"
+    return 0
+  fi
+  return 1
+}
+
+select_bandwidth_mbps() {
+  local selected=0 value total=0 count=0
+  for value in "$@"; do
+    is_uint "$value" || continue
+    (( value > selected )) && selected=$value
+    total=$((total + value))
+    count=$((count + 1))
+  done
+  (( count > 0 )) || return 1
+  case "$BANDWIDTH_POLICY" in
+    peak) printf '%s' "$selected" ;;
+    conservative)
+      selected=0
+      for value in "$@"; do
+        is_uint "$value" || continue
+        if (( selected == 0 || value < selected )); then selected=$value; fi
+      done
+      printf '%s' "$selected"
+      ;;
+    average) awk -v total="$total" -v count="$count" 'BEGIN {printf "%d", (total / count) + 0.5}' ;;
+  esac
+}
+
+detect_relay_rtt_ms() {
+  command -v ping >/dev/null 2>&1 || return 1
+  local output average
+  output=$(ping -n -c 3 -W 2 "$1" 2>/dev/null) || return 1
+  average=$(awk -F/ '/min\/avg\/max/ {printf "%.0f", $2; exit}' <<<"$output")
+  is_uint "$average" || return 1
+  printf '%s' "$average"
+}
+
+BW_FROM_SPEEDTEST=0
+RTT_FROM_PROBE=0
+CLOUDFLARE_MBPS=''
+SPEEDTEST_MBPS=''
+if (( AUTO_DETECT == 1 )); then
+  detect_location || warn 'Unable to identify public server location; continuing without it.'
+  if [[ -z ${BW_MBPS:-} ]]; then
+    CLOUDFLARE_MBPS=$(detect_cloudflare_bandwidth_mbps || true)
+    SPEEDTEST_MBPS=$(detect_speedtest_bandwidth_mbps || true)
+    if detected_bw=$(select_bandwidth_mbps "$CLOUDFLARE_MBPS" "$SPEEDTEST_MBPS"); then
+      BW_MBPS=$detected_bw
+      BW_FROM_SPEEDTEST=1
+      info "Bandwidth sources: Cloudflare=${CLOUDFLARE_MBPS:-unavailable} Mbps; Speedtest=${SPEEDTEST_MBPS:-unavailable} Mbps; policy=${BANDWIDTH_POLICY}."
+    elif ! command -v speedtest >/dev/null 2>&1 && ! command -v speedtest-cli >/dev/null 2>&1; then
+      warn 'Speedtest CLI is not installed; using Cloudflare when available. Install Speedtest separately if you want a second source.'
+    fi
+  fi
+  if [[ -z ${RTT_MS:-} && -n $RELAY_HOST ]]; then
+    if detected_rtt=$(detect_relay_rtt_ms "$RELAY_HOST"); then
+      RTT_MS=$detected_rtt
+      RTT_FROM_PROBE=1
+    fi
+  fi
+fi
+
+if [[ -z ${BW_MBPS:-} ]]; then
+  warn 'Automatic bandwidth test failed. Enter the usable bandwidth manually.'
+  read -r -p 'Peak usable bandwidth in Mbps [1000]: ' BW_INPUT
+  BW_MBPS=${BW_INPUT:-1000}
+else
+  if (( BW_FROM_SPEEDTEST )); then
+    ok "Detected usable bandwidth: ${BW_MBPS} Mbps"
+  else
+    ok "Using bandwidth override: ${BW_MBPS} Mbps"
+  fi
+fi
+if [[ -z ${RTT_MS:-} ]]; then
+  RTT_MS=150
+  warn 'Server location cannot reveal the RTT to your relay destination; using 150 ms. Set RTT_MS=<ms> or RELAY_HOST=<host> for a more accurate value.'
+else
+  if (( RTT_FROM_PROBE )); then
+    ok "Detected relay-host RTT: ${RTT_MS} ms"
+  else
+    ok "Using relay-path RTT override: ${RTT_MS} ms"
+  fi
+fi
 is_uint "$BW_MBPS" || die 'Bandwidth must be a positive integer in Mbps.'
 is_uint "$RTT_MS" || die 'RTT must be a positive integer in milliseconds.'
 
@@ -181,9 +330,38 @@ done > "$BACKUP_DIR/runtime-before.conf"
 
 tmp=$(mktemp)
 modules_tmp=$(mktemp)
+NETDEV_BUDGET_USECS_APPLIED=0
+# A sysctl file must not retain a value the current kernel rejects: systemd-sysctl
+# would otherwise fail again on every boot. Test each intended value and restore the
+# captured value before writing the persistent file. BBR/FQ are required; other
+# tuning knobs are skipped when a restricted VPS kernel rejects them.
+CHANGES_STARTED=1
 emit() {
-  local key=$1 value=$2 path="/proc/sys/${1//./\/}"
-  if [[ -e "$path" ]]; then printf '%s = %s\n' "$key" "$value" >> "$tmp"; else warn "Kernel does not expose $key; skipped."; fi
+  local key=$1 value=$2 path="/proc/sys/${1//./\/}" current
+  if [[ ! -r "$path" ]]; then
+    warn "Kernel does not expose $key; skipped."
+    return 0
+  fi
+  current=$(sysctl -n "$key" 2>/dev/null) || {
+    warn "Kernel does not allow reading $key; skipped."
+    return 0
+  }
+  if ! sysctl -w "$key=$value" >/dev/null 2>&1; then
+    case "$key" in
+      net.core.default_qdisc|net.ipv4.tcp_congestion_control)
+        die "Kernel rejected required setting $key=$value."
+        ;;
+      *)
+        warn "Kernel rejected $key=$value; skipped."
+        return 0
+        ;;
+    esac
+  fi
+  sysctl -w "$key=$current" >/dev/null 2>&1 || die "Unable to restore $key after its preflight check."
+  printf '%s = %s\n' "$key" "$value" >> "$tmp"
+  if [[ $key == net.core.netdev_budget_usecs ]]; then
+    NETDEV_BUDGET_USECS_APPLIED=1
+  fi
 }
 cat > "$tmp" <<EOF
 # Generated by relay-throughput-tune at ${STAMP}
@@ -210,7 +388,6 @@ emit net.core.netdev_budget_usecs "$NETDEV_BUDGET_USECS"
 printf 'tcp_bbr\nsch_fq\n' > "$modules_tmp"
 
 # From this point every abnormal exit restores both files and captured runtime state.
-CHANGES_STARTED=1
 install -m 0644 "$tmp" "$TARGET"
 install -m 0644 "$modules_tmp" "$MODULES_FILE"
 sysctl -p "$TARGET" || die 'sysctl application failed.'
@@ -234,7 +411,11 @@ printf '\nProfile: %s | RAM: %s MiB | CPU: %s | BW: %s Mbps | RTT: %s ms\n' "$PR
 printf 'BDP: %.2f MiB | 2*BDP: %.2f MiB | TCP ceiling: %s MiB\n' \
   "$(awk -v b="$BDP_BYTES" -v m="$MIB" 'BEGIN {printf "%.2f", b/m}')" \
   "$(awk -v b="$TWO_BDP_BYTES" -v m="$MIB" 'BEGIN {printf "%.2f", b/m}')" "$MAX_MB"
-printf 'softirq profile: backlog=%s budget=%s usecs=%s (aggressive=%s)\n' "$NETDEV_BACKLOG" "$NETDEV_BUDGET" "$NETDEV_BUDGET_USECS" "$AGGRESSIVE_SOFTIRQ"
+if (( NETDEV_BUDGET_USECS_APPLIED )); then
+  printf 'softirq profile: backlog=%s budget=%s usecs=%s (aggressive=%s)\n' "$NETDEV_BACKLOG" "$NETDEV_BUDGET" "$NETDEV_BUDGET_USECS" "$AGGRESSIVE_SOFTIRQ"
+else
+  printf 'softirq profile: backlog=%s budget=%s usecs=skipped-by-kernel (aggressive=%s)\n' "$NETDEV_BACKLOG" "$NETDEV_BUDGET" "$AGGRESSIVE_SOFTIRQ"
+fi
 printf 'CC: %s | default qdisc: %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control)" "$(sysctl -n net.core.default_qdisc)"
 if [[ -n ${DEFAULT_IFACE:-} ]] && command -v tc >/dev/null 2>&1; then
   printf 'Current qdisc on %s (may change only after reboot):\n' "$DEFAULT_IFACE"
